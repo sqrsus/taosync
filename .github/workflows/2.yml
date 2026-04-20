@@ -4,10 +4,10 @@ on:
   push:
     branches: [ 'main' ]
     paths: [ 'version.txt' ]
-  workflow_dispatch:  # 🔥 手动触发配置
+  workflow_dispatch:
     inputs:
       architectures:
-        description: '选择构建架构（可多选，逗号分隔）'
+        description: '选择构建架构（逗号分隔，例: loong64,mips64le）'
         required: true
         default: 'loong64,mips64le'
         type: string
@@ -20,7 +20,7 @@ on:
           - 'true'
           - 'false'
       version_suffix:
-        description: '版本后缀（可选，如手动测试可加 -test）'
+        description: '版本后缀（可选，用于测试标识）'
         required: false
         default: ''
         type: string
@@ -32,41 +32,51 @@ env:
 
 jobs:
   get-version:
-    name: 获取版本号
+    name: 获取版本号与配置
     runs-on: ubuntu-latest
     outputs:
       VERSION: ${{ steps.getVersion.outputs.VERSION }}
       ARCH_LIST: ${{ steps.setArch.outputs.ARCH_LIST }}
-      DO_RELEASE: ${{ inputs.release == 'true' && !contains(steps.getVersion.outputs.VERSION, 'dev') }}
+      DO_RELEASE: ${{ steps.releaseCheck.outputs.DO_RELEASE }}
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
       - id: getVersion
-        name: 获取基础版本号
+        name: 获取版本号
         run: |
-          cuVersion=$(head -n 1 version.txt | cut -d',' -f1)
-          # 如果手动触发时指定了后缀，则追加到版本号
+          set -e
+          cuVersion=$(head -n 1 version.txt | cut -d',' -f1 | xargs)
           suffix="${{ inputs.version_suffix }}"
-          if [ -n "$suffix" ]; then
-            echo "VERSION=${cuVersion}${suffix}" >> "$GITHUB_OUTPUT"
-          else
-            echo "VERSION=$cuVersion" >> "$GITHUB_OUTPUT"
-          fi
+          echo "VERSION=${cuVersion}${suffix}" >> "$GITHUB_OUTPUT"
 
       - id: setArch
-        name: 解析构建架构列表
+        name: 生成架构列表 JSON
         run: |
-          # 手动触发时使用输入参数，否则使用默认值
+          set -e
+          # 自动区分 push 和手动触发
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             archInput="${{ inputs.architectures }}"
           else
             archInput="loong64,mips64le"
           fi
-          # 转换为 JSON 数组格式供 matrix 使用
-          archJson=$(echo "$archInput" | tr ',' '\n' | jq -R . | jq -s .)
+          # 使用 Python 安全生成单行 JSON，彻底避免 jq 缺失或换行符导致的 output 解析失败
+          archJson=$(python3 -c "import json,sys; print(json.dumps([x.strip() for x in sys.argv[1].split(',') if x.strip()]))" "$archInput")
           echo "ARCH_LIST=$archJson" >> "$GITHUB_OUTPUT"
+
+      - id: releaseCheck
+        name: 判断是否发布 Release
+        run: |
+          set -e
+          DO_RELEASE="false"
+          # 仅当手动触发选择 true，且版本号不含 dev 时才允许发布
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.release }}" = "true" ] && \
+             [[ "${{ steps.getVersion.outputs.VERSION }}" != *"dev"* ]]; then
+            DO_RELEASE="true"
+          fi
+          echo "DO_RELEASE=$DO_RELEASE" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     name: 构建前端
@@ -76,22 +86,23 @@ jobs:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
 
     steps:
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装Node.js 14.x
+      - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "14.x"
 
       - name: 安装依赖并构建前端
         run: |
+          set -e
           sed -i "s/__version_placeholder__/$VERSION/g" frontend/src/views/page/setting/index.vue
           cd frontend
           npm install
           npm run build
 
-      - name: 上传artifact
+      - name: 上传前端产物
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
@@ -103,6 +114,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ get-version, build-frontend ]
     if: ${{ needs.get-version.outputs.ARCH_LIST != '[]' }}
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
     strategy:
@@ -112,43 +124,37 @@ jobs:
     steps:
       - name: 设置平台变量
         run: |
+          set -e
           arch=${{ matrix.arch }}
           if [ "$arch" = "loong64" ]; then
             echo "ARCH_NAME=loongson-newworld" >> $GITHUB_ENV
-            echo "DEBIAN_ARCH=loongarch64" >> $GITHUB_ENV
+            echo "BASE_IMAGE=loongson/ubuntu:22.04" >> $GITHUB_ENV
           else
             echo "ARCH_NAME=loongson-oldworld" >> $GITHUB_ENV
-            echo "DEBIAN_ARCH=mips64el" >> $GITHUB_ENV
+            echo "BASE_IMAGE=debian:bullseye" >> $GITHUB_ENV
           fi
 
-      - name: 设置QEMU
+      - name: 设置 QEMU
         uses: docker/setup-qemu-action@v3
         with:
           platforms: linux/${{ matrix.arch }}
 
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载前端构建产物
+      - name: 下载前端产物
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
 
-      - name: 创建构建容器并执行打包
+      - name: 容器内交叉编译打包
         run: |
-          # 根据架构选择基础镜像
-          if [ "${{ matrix.arch }}" = "loong64" ]; then
-            BASE_IMAGE="loongson/ubuntu:22.04"
-          else
-            BASE_IMAGE="debian:bullseye"
-          fi
-          
-          # 启动容器并执行构建（添加缓存加速）
+          set -e
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v $(pwd):/workspace \
             -w /workspace \
-            $BASE_IMAGE bash -c "
+            ${{ env.BASE_IMAGE }} bash -c "
               apt-get update && apt-get install -y python3 python3-pip python3-venv build-essential
               python3 -m venv /opt/venv
               source /opt/venv/bin/activate
@@ -160,7 +166,7 @@ jobs:
               tar czf '${{ env.APP_NAME }}-${{ env.VERSION }}-${{ env.ARCH_NAME }}.tar.gz' *
             "
 
-      - name: 上传龙芯构建产物
+      - name: 上传龙芯产物
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ env.ARCH_NAME }}
@@ -168,38 +174,40 @@ jobs:
           retention-days: 1
 
   create-release:
-    name: 发布release
+    name: 发布 Release
     runs-on: ubuntu-latest
     needs: [get-version, build-loongson]
     if: ${{ needs.get-version.outputs.DO_RELEASE == 'true' }}
     env:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
     steps:
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载构建结果
+      - name: 下载所有构建产物
         uses: actions/download-artifact@v4
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
 
-      - name: 没有版本日志文件自动创建
+      - name: 准备 Changelog
         run: |
+          set -e
           version_first=$(echo $VERSION | cut -d'-' -f1)
           LOG_FILE="doc/changelog/$version_first.md"
+          mkdir -p doc/changelog
           if [ ! -f "$LOG_FILE" ]; then
             touch "$LOG_FILE"
-            echo "$VERSION" > "$LOG_FILE"
+            echo "## $VERSION" >> "$LOG_FILE"
           fi
           echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
 
-      - name: 创建release
+      - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
           files: dist/*
           body_path: ${{ env.LOG_FILE }}
+          draft: true
           prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
-          draft: true  # 🔥 手动发布时先创建为草稿，确认后再公开
