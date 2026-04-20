@@ -1,11 +1,11 @@
-name: 构建2
+name: 构建
 
 on:
   push:
     branches: [ 'main' ]
     paths: [ 'version.txt' ]
-  workflow_dispatch:  # 添加手动触发支持
-    inputs:  # 可选：定义输入参数
+  workflow_dispatch:
+    inputs:
       version:
         description: '版本号（留空则自动从version.txt读取）'
         required: false
@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       VERSION: ${{ steps.getVersion.outputs.VERSION }}
+      SKIP_FRONTEND: ${{ steps.getVersion.outputs.SKIP_FRONTEND }}
 
     steps:
       - name: 检出仓库代码
@@ -39,26 +40,37 @@ jobs:
       - id: getVersion
         name: 获取版本号
         run: |
-          versions=$(head -n 1 version.txt | tr -d '\r\n')
-          if [ -z "$versions" ]; then
-            echo "Error: version.txt is empty"
-            exit 1
+          # 处理手动输入的版本号
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "✅ 使用手动输入的版本号: $VERSION"
+          else
+            # 从 version.txt 读取
+            versions=$(head -n 1 version.txt | tr -d '\r\n')
+            if [ -z "$versions" ]; then
+              echo "❌ Error: version.txt is empty"
+              exit 1
+            fi
+            IFS=',' read -ra versionList <<< "$versions"
+            VERSION="${versionList[0]}"
+            echo "✅ 使用文件中的版本号: $VERSION"
           fi
           
-          IFS=',' read -ra versionList <<< "$versions"
-          if [ ${#versionList[@]} -eq 0 ]; then
-            echo "Error: No version found"
-            exit 1
+          # 处理跳过前端构建的选项
+          SKIP_FRONTEND="false"
+          if [ "${{ inputs.skip_frontend_build }}" = "true" ]; then
+            SKIP_FRONTEND="true"
+            echo "⚠️ 将跳过前端构建（使用已存在的前端产物）"
           fi
           
-          cuVersion="${versionList[0]}"
-          echo "VERSION=$cuVersion" >> "$GITHUB_OUTPUT"
-          echo "Version: $cuVersion"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "SKIP_FRONTEND=$SKIP_FRONTEND" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     name: 构建前端
     runs-on: ubuntu-latest
     needs: [ get-version ]
+    if: ${{ needs.get-version.outputs.SKIP_FRONTEND != 'true' }}
     env:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
 
@@ -66,10 +78,11 @@ jobs:
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 安装Node.js 14.x
+      # 升级 Node.js 版本到 18 或 20（Node 14 也已过时）
+      - name: 安装Node.js 20.x
         uses: actions/setup-node@v4
         with:
-          node-version: "14.x"
+          node-version: "20.x"  # 从 14.x 升级到 20.x
 
       - name: 缓存Node.js模块
         uses: actions/cache@v4
@@ -211,7 +224,12 @@ jobs:
     needs: [get-version, build-windows, build-linux]
     env:
       VERSION: ${{needs.get-version.outputs.VERSION}}
-    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') || inputs.force_release == 'true' }}
+    permissions:
+      contents: write  # 关键：授予写入权限
+      issues: write    # 可选：如果需要操作 issues
+      pull-requests: write  # 可选：如果需要操作 PR
+    
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
@@ -234,6 +252,7 @@ jobs:
           fi
           echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
 
+      # 方案1：使用最新版本的 softprops/action-gh-release
       - name: 创建release
         uses: softprops/action-gh-release@v2
         with:
@@ -241,3 +260,8 @@ jobs:
           files: dist/*
           body_path: ${{ env.LOG_FILE }}
           prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
+          generate_release_notes: false  # 是否自动生成 release notes
+          draft: false  # 是否为草稿
+          # 如果还是权限问题，可以尝试使用 GITHUB_TOKEN 明确指定
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
