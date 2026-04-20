@@ -1,9 +1,29 @@
-name: 构建
+name: 构建龙芯
 
 on:
   push:
     branches: [ 'main' ]
     paths: [ 'version.txt' ]
+  workflow_dispatch:  # 🔥 手动触发配置
+    inputs:
+      architectures:
+        description: '选择构建架构（可多选，逗号分隔）'
+        required: true
+        default: 'loong64,mips64le'
+        type: string
+      release:
+        description: '是否发布到 Release'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      version_suffix:
+        description: '版本后缀（可选，如手动测试可加 -test）'
+        required: false
+        default: ''
+        type: string
 
 env:
   APP_NAME: taoSync
@@ -15,25 +35,38 @@ jobs:
     name: 获取版本号
     runs-on: ubuntu-latest
     outputs:
-      TAG_LIST: ${{ steps.getVersion.outputs.TAG_LIST }}
       VERSION: ${{ steps.getVersion.outputs.VERSION }}
+      ARCH_LIST: ${{ steps.setArch.outputs.ARCH_LIST }}
+      DO_RELEASE: ${{ inputs.release == 'true' && !contains(steps.getVersion.outputs.VERSION, 'dev') }}
 
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
       - id: getVersion
-        name: 获取版本号
+        name: 获取基础版本号
         run: |
-          versions=$(head -n 1 version.txt)
-          tagList=""
-          IFS=',' read -ra versionList <<< "$versions"
-          cuVersion="${versionList[0]}"
-          for version in "${versionList[@]}"; do
-            tagList+="-t $DOCKER_USER/$DOCKER_NAME:$version "
-          done
-          echo "TAG_LIST=$tagList" >> "$GITHUB_OUTPUT"
-          echo "VERSION=$cuVersion" >> "$GITHUB_OUTPUT"
+          cuVersion=$(head -n 1 version.txt | cut -d',' -f1)
+          # 如果手动触发时指定了后缀，则追加到版本号
+          suffix="${{ inputs.version_suffix }}"
+          if [ -n "$suffix" ]; then
+            echo "VERSION=${cuVersion}${suffix}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=$cuVersion" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: setArch
+        name: 解析构建架构列表
+        run: |
+          # 手动触发时使用输入参数，否则使用默认值
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            archInput="${{ inputs.architectures }}"
+          else
+            archInput="loong64,mips64le"
+          fi
+          # 转换为 JSON 数组格式供 matrix 使用
+          archJson=$(echo "$archInput" | tr ',' '\n' | jq -R . | jq -s .)
+          echo "ARCH_LIST=$archJson" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     name: 构建前端
@@ -69,13 +102,12 @@ jobs:
     name: 构建龙芯可执行文件
     runs-on: ubuntu-latest
     needs: [ get-version, build-frontend ]
+    if: ${{ needs.get-version.outputs.ARCH_LIST != '[]' }}
     env:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
     strategy:
       matrix:
-        arch:
-          - loong64        # 龙芯新世界：LoongArch64
-          - mips64le       # 龙芯旧世界：MIPS64 小端
+        arch: ${{ fromJson(needs.get-version.outputs.ARCH_LIST) }}
 
     steps:
       - name: 设置平台变量
@@ -105,14 +137,14 @@ jobs:
 
       - name: 创建构建容器并执行打包
         run: |
-          # 根据架构选择基础镜像（需确保镜像支持目标架构）
+          # 根据架构选择基础镜像
           if [ "${{ matrix.arch }}" = "loong64" ]; then
             BASE_IMAGE="loongson/ubuntu:22.04"
           else
             BASE_IMAGE="debian:bullseye"
           fi
           
-          # 启动容器并执行构建
+          # 启动容器并执行构建（添加缓存加速）
           docker run --rm --platform linux/${{ matrix.arch }} \
             -v $(pwd):/workspace \
             -w /workspace \
@@ -120,6 +152,7 @@ jobs:
               apt-get update && apt-get install -y python3 python3-pip python3-venv build-essential
               python3 -m venv /opt/venv
               source /opt/venv/bin/activate
+              pip install --upgrade pip
               pip install 'pyinstaller>=6,<7'
               pip install -r requirements.txt
               python3 -m PyInstaller ${{ env.APP_NAME }}.spec
@@ -138,9 +171,9 @@ jobs:
     name: 发布release
     runs-on: ubuntu-latest
     needs: [get-version, build-loongson]
+    if: ${{ needs.get-version.outputs.DO_RELEASE == 'true' }}
     env:
-      VERSION: ${{needs.get-version.outputs.VERSION}}
-    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
@@ -169,3 +202,4 @@ jobs:
           files: dist/*
           body_path: ${{ env.LOG_FILE }}
           prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
+          draft: true  # 🔥 手动发布时先创建为草稿，确认后再公开
