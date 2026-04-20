@@ -1,9 +1,26 @@
-name: 构建
+name: 构建2
 
 on:
   push:
     branches: [ 'main' ]
     paths: [ 'version.txt' ]
+  workflow_dispatch:  # 添加手动触发支持
+    inputs:  # 可选：定义输入参数
+      version:
+        description: '版本号（留空则自动从version.txt读取）'
+        required: false
+        type: string
+        default: ''
+      skip_frontend_build:
+        description: '跳过前端构建'
+        required: false
+        type: boolean
+        default: false
+      force_release:
+        description: '强制创建Release（即使版本号包含dev/pre/beta）'
+        required: false
+        type: boolean
+        default: false
 
 env:
   APP_NAME: taoSync
