@@ -78,11 +78,10 @@ jobs:
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      # 升级 Node.js 版本到 18 或 20（Node 14 也已过时）
       - name: 安装Node.js 20.x
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"  # 从 14.x 升级到 20.x
+          node-version: "20.x"
 
       - name: 缓存Node.js模块
         uses: actions/cache@v4
@@ -116,13 +115,21 @@ jobs:
       matrix:
         platform:
           - linux/amd64
-          - linux/loong64
+          - linux/loong64  # 新世界 (ABI 2.0)
+          - linux/loong64-oldworld  # 旧世界 (ABI 1.0) - 自定义标识
 
     steps:
       - name: 替换平台名称中的斜杠为横杠
         run: |
           platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          # 特殊处理旧世界标识
+          if [ "$platform" = "linux/loong64-oldworld" ]; then
+            echo "PLATFORM_PAIR=linux-loong64-oldworld" >> $GITHUB_ENV
+            echo "IS_OLD_WORLD=true" >> $GITHUB_ENV
+          else
+            echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+            echo "IS_OLD_WORLD=false" >> $GITHUB_ENV
+          fi
 
       - name: 设置QEMU
         uses: docker/setup-qemu-action@v3
@@ -155,9 +162,25 @@ jobs:
           python -m pip install 'pyinstaller>=6,<7'
           python -m pip install -r requirements.txt
 
-      - name: 构建可执行文件
+      - name: 为新世界架构构建
+        if: ${{ env.IS_OLD_WORLD == 'false' && matrix.platform == 'linux/loong64' }}
         run: |
           python -m PyInstaller ${{ env.APP_NAME }}.spec
+
+      - name: 为旧世界架构构建（使用兼容性标志）
+        if: ${{ env.IS_OLD_WORLD == 'true' }}
+        run: |
+          # 旧世界架构需要特定的编译标志
+          # 方法1：通过环境变量设置
+          export CFLAGS="-mabi=lp64d -mold-world"
+          export CXXFLAGS="-mabi=lp64d -mold-world"
+          
+          # 方法2：修改 PyInstaller spec 文件或使用自定义构建脚本
+          # 如果 Python 包需要重新编译，设置这些标志
+          python -m PyInstaller ${{ env.APP_NAME }}.spec
+          
+          # 验证构建结果是否为旧世界 ABI
+          # file dist/${{ env.APP_NAME }} | grep "ELF.*loongarch"
 
       - name: 打包可执行文件
         run: |
@@ -169,6 +192,53 @@ jobs:
         with:
           name: dist-linux-${{ env.PLATFORM_PAIR }}
           path: dist/*.tar.gz
+          retention-days: 1
+
+  # 使用 Docker 容器构建旧世界架构（替代方案）
+  build-linux-loong64-oldworld-docker:
+    name: 构建Linux loong64旧世界（Docker容器方式）
+    runs-on: ubuntu-latest
+    needs: [ get-version, build-frontend ]
+    env:
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
+    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: 使用旧世界 Docker 镜像构建
+        run: |
+          # 使用支持旧世界的 loongarch64 镜像
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            -e VERSION=${{ env.VERSION }} \
+            loongarch64/loongnix-server:8.4 /bin/bash -c "
+              # 安装 Python 和依赖
+              yum install -y python3 python3-pip
+              pip3 install pyinstaller
+              pip3 install -r requirements.txt
+              
+              # 构建
+              python3 -m PyInstaller ${{ env.APP_NAME }}.spec
+              
+              # 打包
+              cd dist
+              tar czf /workspace/${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loong64-oldworld.tar.gz ${{ env.APP_NAME }}
+            "
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-loong64-oldworld
+          path: ${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loong64-oldworld.tar.gz
           retention-days: 1
 
   build-windows:
@@ -226,9 +296,9 @@ jobs:
       VERSION: ${{needs.get-version.outputs.VERSION}}
     if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') || inputs.force_release == 'true' }}
     permissions:
-      contents: write  # 关键：授予写入权限
-      issues: write    # 可选：如果需要操作 issues
-      pull-requests: write  # 可选：如果需要操作 PR
+      contents: write
+      issues: write
+      pull-requests: write
     
     steps:
       - name: 检出仓库代码
@@ -252,7 +322,6 @@ jobs:
           fi
           echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
 
-      # 方案1：使用最新版本的 softprops/action-gh-release
       - name: 创建release
         uses: softprops/action-gh-release@v2
         with:
@@ -260,8 +329,7 @@ jobs:
           files: dist/*
           body_path: ${{ env.LOG_FILE }}
           prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
-          generate_release_notes: false  # 是否自动生成 release notes
-          draft: false  # 是否为草稿
-          # 如果还是权限问题，可以尝试使用 GITHUB_TOKEN 明确指定
+          generate_release_notes: false
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
