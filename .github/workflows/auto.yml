@@ -24,6 +24,7 @@ on:
 
 env:
   APP_NAME: taoSync
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   get-version:
@@ -65,6 +66,8 @@ jobs:
           
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           echo "SKIP_FRONTEND=$SKIP_FRONTEND" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION"
+          echo "SKIP_FRONTEND=$SKIP_FRONTEND"
 
   build-frontend:
     name: 构建前端
@@ -93,7 +96,12 @@ jobs:
 
       - name: 安装依赖并构建前端
         run: |
-          sed -i "s/__version_placeholder__/$VERSION/g" frontend/src/views/page/setting/index.vue
+          # 检查 version 占位符文件是否存在
+          if [ -f "frontend/src/views/page/setting/index.vue" ]; then
+            sed -i "s/__version_placeholder__/$VERSION/g" frontend/src/views/page/setting/index.vue
+          else
+            echo "⚠️ 警告: version 占位符文件不存在，跳过替换"
+          fi
           cd frontend
           npm install
           npm run build
@@ -104,36 +112,17 @@ jobs:
           name: frontend-dist
           path: frontend/dist
           retention-days: 1
+          if-no-files-found: warn
 
-  build-linux:
-    name: 构建Linux
+  # 龙芯新世界架构构建（使用 QEMU 模拟）
+  build-loongarch64-newworld:
+    name: 构建龙芯新世界 (loongarch64)
     runs-on: ubuntu-latest
     needs: [ get-version, build-frontend ]
     env:
       VERSION: ${{ needs.get-version.outputs.VERSION }}
-    strategy:
-      matrix:
-        platform:
-          - linux/amd64
-          - linux/loong64  # 新世界 (ABI 2.0)
-          - linux/loong64-oldworld  # 旧世界 (ABI 1.0) - 自定义标识
 
     steps:
-      - name: 替换平台名称中的斜杠为横杠
-        run: |
-          platform=${{ matrix.platform }}
-          # 特殊处理旧世界标识
-          if [ "$platform" = "linux/loong64-oldworld" ]; then
-            echo "PLATFORM_PAIR=linux-loong64-oldworld" >> $GITHUB_ENV
-            echo "IS_OLD_WORLD=true" >> $GITHUB_ENV
-          else
-            echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-            echo "IS_OLD_WORLD=false" >> $GITHUB_ENV
-          fi
-
-      - name: 设置QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
@@ -143,162 +132,207 @@ jobs:
           name: frontend-dist
           path: frontend/dist
 
-      - name: 设置Python环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - name: 设置QEMU用户态模拟
+        uses: docker/setup-qemu-action@v3
 
-      - name: 缓存pip包
-        uses: actions/cache@v4
+      - name: 安装QEMU loongarch64支持
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+
+      - name: 注册loongarch64 binfmt
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: 使用容器构建loongarch64新世界
+        run: |
+          # 创建构建脚本
+          cat > build.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "开始构建 loongarch64 新世界版本..."
+          
+          # 更新并安装依赖
+          apt-get update
+          apt-get install -y python3 python3-pip
+          
+          pip3 install --upgrade pip
+          pip3 install 'pyinstaller>=6,<7'
+          pip3 install -r requirements.txt
+          
+          # 构建
+          python3 -m PyInstaller taoSync.spec
+          
+          # 检查产物
+          if [ ! -f "dist/taoSync" ]; then
+            echo "构建失败：未找到可执行文件"
+            exit 1
+          fi
+          
+          echo "构建成功"
+          file dist/taoSync
+          EOF
+          
+          chmod +x build.sh
+          
+          # 使用 loongarch64 架构容器运行
+          docker run --rm \
+            --platform linux/loong64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            loongarch64/debian:buster-slim \
+            /bin/bash -c "apt-get update && apt-get install -y file && bash /workspace/build.sh"
+          
+          # 打包
+          cd dist
+          tar czf "${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loongarch64-newworld.tar.gz" ${{ env.APP_NAME }}
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          name: dist-loongarch64-newworld
+          path: dist/*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  # 龙芯旧世界架构构建（使用 QEMU 模拟 + 旧世界标志）
+  build-loongarch64-oldworld:
+    name: 构建龙芯旧世界 (loongarch64)
+    runs-on: ubuntu-latest
+    needs: [ get-version, build-frontend ]
+    env:
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: 设置QEMU用户态模拟
+        uses: docker/setup-qemu-action@v3
+
+      - name: 安装QEMU loongarch64支持
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+
+      - name: 注册loongarch64 binfmt
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: 使用容器构建loongarch64旧世界
+        run: |
+          # 创建构建脚本
+          cat > build-oldworld.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "开始构建 loongarch64 旧世界版本..."
+          
+          # 更新并安装依赖（使用旧世界兼容的源）
+          apt-get update
+          apt-get install -y python3 python3-pip gcc g++
+          
+          # 设置旧世界编译标志
+          export CFLAGS="-mabi=lp64d -mold-world"
+          export CXXFLAGS="-mabi=lp64d -mold-world"
+          export LDFLAGS="-mabi=lp64d -mold-world"
+          
+          pip3 install --upgrade pip
+          pip3 install 'pyinstaller>=6,<7'
+          pip3 install -r requirements.txt
+          
+          # 构建
+          python3 -m PyInstaller taoSync.spec
+          
+          # 检查产物
+          if [ ! -f "dist/taoSync" ]; then
+            echo "构建失败：未找到可执行文件"
+            exit 1
+          fi
+          
+          echo "构建成功"
+          file dist/taoSync
+          EOF
+          
+          chmod +x build-oldworld.sh
+          
+          # 使用 loongarch64 架构容器运行
+          docker run --rm \
+            --platform linux/loong64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            loongarch64/debian:buster-slim \
+            /bin/bash -c "apt-get update && apt-get install -y file gcc g++ && bash /workspace/build-oldworld.sh"
+          
+          # 打包
+          cd dist
+          tar czf "${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loongarch64-oldworld.tar.gz" ${{ env.APP_NAME }}
+
+      - name: 上传artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-loongarch64-oldworld
+          path: dist/*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  # 使用自托管运行器构建旧世界（备选方案，更可靠）
+  build-loongarch64-oldworld-native:
+    name: 构建龙芯旧世界（原生环境）
+    runs-on: [self-hosted, loongarch64, oldworld]
+    needs: [ get-version, build-frontend ]
+    env:
+      VERSION: ${{ needs.get-version.outputs.VERSION }}
+    if: false  # 默认禁用，需要自托管运行器时改为 true
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 下载前端
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
 
       - name: 安装依赖
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install 'pyinstaller>=6,<7'
-          python -m pip install -r requirements.txt
+          pip3 install --upgrade pip
+          pip3 install 'pyinstaller>=6,<7'
+          pip3 install -r requirements.txt
 
-      - name: 为新世界架构构建
-        if: ${{ env.IS_OLD_WORLD == 'false' && matrix.platform == 'linux/loong64' }}
+      - name: 构建
         run: |
-          python -m PyInstaller ${{ env.APP_NAME }}.spec
+          python3 -m PyInstaller ${{ env.APP_NAME }}.spec
 
-      - name: 为旧世界架构构建（使用兼容性标志）
-        if: ${{ env.IS_OLD_WORLD == 'true' }}
-        run: |
-          # 旧世界架构需要特定的编译标志
-          # 方法1：通过环境变量设置
-          export CFLAGS="-mabi=lp64d -mold-world"
-          export CXXFLAGS="-mabi=lp64d -mold-world"
-          
-          # 方法2：修改 PyInstaller spec 文件或使用自定义构建脚本
-          # 如果 Python 包需要重新编译，设置这些标志
-          python -m PyInstaller ${{ env.APP_NAME }}.spec
-          
-          # 验证构建结果是否为旧世界 ABI
-          # file dist/${{ env.APP_NAME }} | grep "ELF.*loongarch"
-
-      - name: 打包可执行文件
+      - name: 打包
         run: |
           cd dist
-          tar czf "${{ env.APP_NAME }}-${{ env.VERSION }}-${{ env.PLATFORM_PAIR }}.tar.gz" ${{ env.APP_NAME }}
+          tar czf "${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loongarch64-oldworld.tar.gz" ${{ env.APP_NAME }}
 
       - name: 上传artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist-linux-${{ env.PLATFORM_PAIR }}
+          name: dist-loongarch64-oldworld-native
           path: dist/*.tar.gz
-          retention-days: 1
-
-  # 使用 Docker 容器构建旧世界架构（替代方案）
-  build-linux-loong64-oldworld-docker:
-    name: 构建Linux loong64旧世界（Docker容器方式）
-    runs-on: ubuntu-latest
-    needs: [ get-version, build-frontend ]
-    env:
-      VERSION: ${{ needs.get-version.outputs.VERSION }}
-    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
-
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 下载前端
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist
-
-      - name: 使用旧世界 Docker 镜像构建
-        run: |
-          # 使用支持旧世界的 loongarch64 镜像
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            -e VERSION=${{ env.VERSION }} \
-            loongarch64/loongnix-server:8.4 /bin/bash -c "
-              # 安装 Python 和依赖
-              yum install -y python3 python3-pip
-              pip3 install pyinstaller
-              pip3 install -r requirements.txt
-              
-              # 构建
-              python3 -m PyInstaller ${{ env.APP_NAME }}.spec
-              
-              # 打包
-              cd dist
-              tar czf /workspace/${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loong64-oldworld.tar.gz ${{ env.APP_NAME }}
-            "
-
-      - name: 上传artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-linux-loong64-oldworld
-          path: ${{ env.APP_NAME }}-${{ env.VERSION }}-linux-loong64-oldworld.tar.gz
-          retention-days: 1
-
-  build-windows:
-    name: 构建Windows
-    runs-on: windows-latest
-    needs: [get-version, build-frontend]
-    env:
-      VERSION: ${{needs.get-version.outputs.VERSION}}
-    if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') }}
-
-    steps:
-      - name: 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 下载前端
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist
-
-      - name: 设置Python环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 缓存pip包
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: 安装依赖并构建打包
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install 'pyinstaller>=6,<7'
-          python -m pip install -r requirements.txt
-          python -m PyInstaller ${{ env.APP_NAME }}.spec
-          cd dist
-          7z a ${{ env.APP_NAME }}-${{ env.VERSION }}-windows-amd64.zip *
-
-      - name: 上传artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-windows-amd64
-          path: dist/*.zip
           retention-days: 1
 
   create-release:
     name: 发布release
     runs-on: ubuntu-latest
-    needs: [get-version, build-windows, build-linux]
+    needs: [get-version, build-loongarch64-newworld, build-loongarch64-oldworld]
     env:
       VERSION: ${{needs.get-version.outputs.VERSION}}
     if: ${{ !contains(needs.get-version.outputs.VERSION, 'dev') || inputs.force_release == 'true' }}
     permissions:
       contents: write
-      issues: write
-      pull-requests: write
     
     steps:
       - name: 检出仓库代码
@@ -311,14 +345,30 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: 没有版本日志文件自动创建
+      - name: 列出下载的文件
+        run: |
+          echo "下载的文件列表："
+          ls -la dist/ || echo "dist 目录为空"
+
+      - name: 重命名文件使名称更清晰
+        run: |
+          cd dist
+          # 统一命名格式
+          for file in *.tar.gz; do
+            echo "找到文件: $file"
+          done
+
+      - name: 创建版本日志文件
         run: |
           version_first=$(echo $VERSION | cut -d'-' -f1)
           LOG_FILE="doc/changelog/$version_first.md"
           if [ ! -f "$LOG_FILE" ]; then
             mkdir -p doc/changelog
-            touch "$LOG_FILE"
-            echo "$VERSION" > "$LOG_FILE"
+            echo "# $VERSION" > "$LOG_FILE"
+            echo "" >> "$LOG_FILE"
+            echo "## 更新内容" >> "$LOG_FILE"
+            echo "" >> "$LOG_FILE"
+            echo "- 待补充" >> "$LOG_FILE"
           fi
           echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
 
@@ -326,10 +376,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
-          files: dist/*
+          files: dist/*.tar.gz
           body_path: ${{ env.LOG_FILE }}
           prerelease: ${{ contains(env.VERSION, 'dev') || contains(env.VERSION, 'pre') || contains(env.VERSION, 'beta') }}
-          generate_release_notes: false
-          draft: false
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
